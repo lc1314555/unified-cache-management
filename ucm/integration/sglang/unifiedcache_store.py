@@ -43,9 +43,11 @@ class UnifiedCacheStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        if mem_pool_host.layout != "page_first":
+        supported_layouts = {"page_first", "page_first_kv_split"}
+        if mem_pool_host.layout not in supported_layouts:
             raise ValueError(
-                "UnifiedCacheStore currently requires --hicache-mem-layout page_first, "
+                "UnifiedCacheStore currently requires --hicache-mem-layout "
+                "page_first or page_first_kv_split, "
                 f"got {mem_pool_host.layout!r}."
             )
 
@@ -129,9 +131,8 @@ class UnifiedCacheStore(HiCacheStorage):
         return False
 
     def close(self) -> None:
-        close = getattr(self.store, "close", None)
-        if callable(close):
-            close()
+        if self.connector is not None:
+            self.connector.close()
 
     def get_stats(self):
         connector = self.connector
