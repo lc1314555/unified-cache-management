@@ -78,8 +78,8 @@ class FakeStore:
         return self.prefix
 
 
-def _make_pool():
-    return SimpleNamespace(
+def _make_pool(with_indexer=False):
+    pool = SimpleNamespace(
         page_size=2,
         page_num=4,
         layout="page_first_kv_split",
@@ -88,6 +88,8 @@ def _make_pool():
         v_buffer=FakeBuffer(0x200000, 200),
         get_size_per_token=lambda: 75,
     )
+    pool.index_k_buffer = FakeBuffer(0x300000, 120) if with_indexer else None
+    return pool
 
 
 def _make_storage_config(storage_backends="/mnt/ucm0:/mnt/ucm1"):
@@ -166,3 +168,60 @@ def test_split_mla_requires_both_stores_for_a_hit():
     k_store.prefix = 4
     v_store.prefix = 2
     assert connector.batch_exists(["0", "1", "2", "3", "4"]) == 3
+
+
+def test_split_ascend_mla_adds_optional_indexer_store(tmp_path):
+    backend = tmp_path / "ucm"
+    pool = _make_pool(with_indexer=True)
+    config = UnifiedCacheStoreConfig.load_from_config(
+        _make_storage_config(str(backend)), pool
+    )
+
+    assert list(config.component_configs) == ["k", "v", "indexer"]
+    indexer_config = config.component_configs["indexer"]
+    assert indexer_config["storage_backends"] == [str(backend / "indexer")]
+    assert indexer_config["tensor_size"] == 30
+    assert indexer_config["shard_size"] == 30
+
+
+def test_split_ascend_mla_transfers_and_requires_indexer():
+    stores = {name: FakeStore() for name in ("k", "v", "indexer")}
+    connector = SglangUcmConnector(
+        stores["k"],
+        _make_pool(with_indexer=True),
+        _make_storage_config(),
+        ["/mnt/ucm0/k"],
+        v_store=stores["v"],
+        component_stores=stores,
+    )
+    host_indices = FakeHostIndices([0, 1, 2, 3])
+
+    assert connector.batch_set_v1(["page0", "page1"], host_indices) == [True, True]
+    assert stores["k"].dumps[0][1:] == (
+        [0, 0],
+        [[0x100000], [0x100000 + 100]],
+    )
+    assert stores["v"].dumps[0][1:] == (
+        [0, 0],
+        [[0x200000], [0x200000 + 50]],
+    )
+    assert stores["indexer"].dumps[0][1:] == (
+        [0, 0],
+        [[0x300000], [0x300000 + 30]],
+    )
+
+    assert connector.batch_get_v1(["page0", "page1"], host_indices) == [True, True]
+    assert stores["indexer"].loads[0][1:] == (
+        [0, 0],
+        [[0x300000], [0x300000 + 30]],
+    )
+
+    stores["k"].lookup_result = [True]
+    stores["v"].lookup_result = [True]
+    stores["indexer"].lookup_result = [False]
+    assert connector.exists("page0") is False
+
+    stores["k"].prefix = 4
+    stores["v"].prefix = 4
+    stores["indexer"].prefix = 1
+    assert connector.batch_exists(["0", "1", "2", "3", "4"]) == 2

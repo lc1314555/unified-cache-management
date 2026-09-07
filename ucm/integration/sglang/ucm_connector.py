@@ -3,7 +3,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import yaml
@@ -21,31 +21,46 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _page_first_kv_split_buffers(mem_pool_host: "HostKVCache") -> List[torch.Tensor]:
-    buffers = [mem_pool_host.k_buffer, mem_pool_host.v_buffer]
-    for name, buffer in zip(("k", "v"), buffers):
+def _page_first_kv_split_components(
+    mem_pool_host: "HostKVCache",
+) -> List[Tuple[str, torch.Tensor]]:
+    """Return buffers physically owned by an Ascend split MLA host pool.
+
+    Ascend keeps the optional, unquantized index K cache on the primary MLA
+    host pool.  CUDA DSA instead exposes a separate V2 INDEXER host pool and is
+    deliberately not handled here.
+    """
+    components = [
+        ("k", mem_pool_host.k_buffer),
+        ("v", mem_pool_host.v_buffer),
+    ]
+    index_k_buffer = getattr(mem_pool_host, "index_k_buffer", None)
+    if index_k_buffer is not None:
+        components.append(("indexer", index_k_buffer))
+
+    for name, buffer in components:
         if not buffer.is_contiguous():
             raise ValueError(
                 f"page_first_kv_split {name}_buffer must be contiguous"
             )
-    return buffers
+    return components
 
 
 def _page_first_kv_split_tensor_sizes(
     mem_pool_host: "HostKVCache",
-) -> List[int]:
+) -> Dict[str, int]:
     page_num = int(mem_pool_host.page_num)
     if page_num <= 0:
         raise ValueError(f"invalid page_num for page_first_kv_split: {page_num}")
 
-    sizes = []
-    for buffer in _page_first_kv_split_buffers(mem_pool_host):
+    sizes = {}
+    for component, buffer in _page_first_kv_split_components(mem_pool_host):
         nbytes = int(buffer.numel()) * int(buffer.element_size())
         if nbytes % page_num != 0:
             raise ValueError(
                 f"buffer bytes {nbytes} are not divisible by page_num {page_num}"
             )
-        sizes.append(nbytes // page_num)
+        sizes[component] = nbytes // page_num
     return sizes
 
 
@@ -64,6 +79,20 @@ def _component_storage_backends(
         component_backend.mkdir(parents=True, exist_ok=True)
         component_backends.append(str(component_backend))
     return component_backends
+
+
+def _make_posix_component_config(
+    base_config: Dict[str, Any], component: str, page_bytes: int
+) -> Dict[str, Any]:
+    component_config = dict(base_config)
+    component_config.pop("tensor_size_list", None)
+    component_config["storage_backends"] = _component_storage_backends(
+        base_config["storage_backends"], component
+    )
+    component_config["tensor_size"] = page_bytes
+    component_config["shard_size"] = page_bytes
+    component_config["block_size"] = page_bytes
+    return component_config
 
 
 def _load_extra_config_from_yaml_env() -> Optional[Dict[str, Any]]:
@@ -114,9 +143,6 @@ class UnifiedCacheStoreConfig:
             )
 
         page_size = mem_pool_host.page_size
-        page_bytes = page_size * mem_pool_host.get_size_per_token()
-        tensor_size = page_bytes if storage_config.is_mla_model else page_bytes // 2
-        block_size = tensor_size * (1 if storage_config.is_mla_model else 2)
         is_kv_split = (
             storage_config.is_mla_model
             and mem_pool_host.layout == "page_first_kv_split"
@@ -146,11 +172,10 @@ class UnifiedCacheStoreConfig:
             tensor_sizes = _page_first_kv_split_tensor_sizes(mem_pool_host)
             io_direct = bool(cfg.get("io_direct", True))
             if io_direct:
-                for component, buffer, size in zip(
-                    ("k", "v"),
-                    _page_first_kv_split_buffers(mem_pool_host),
-                    tensor_sizes,
+                for component, buffer in _page_first_kv_split_components(
+                    mem_pool_host
                 ):
+                    size = tensor_sizes[component]
                     if buffer.data_ptr() % 4096 or size % 4096:
                         raise ValueError(
                             f"page_first_kv_split {component} is not "
@@ -159,17 +184,10 @@ class UnifiedCacheStoreConfig:
                             f"size_align={size % 4096}; set io_direct=false"
                         )
 
-            component_configs = {}
-            for component, size in zip(("k", "v"), tensor_sizes):
-                component_cfg = dict(cfg)
-                component_cfg.pop("tensor_size_list", None)
-                component_cfg["storage_backends"] = _component_storage_backends(
-                    cfg["storage_backends"], component
-                )
-                component_cfg["tensor_size"] = size
-                component_cfg["shard_size"] = size
-                component_cfg["block_size"] = size
-                component_configs[component] = component_cfg
+            component_configs = {
+                component: _make_posix_component_config(cfg, component, size)
+                for component, size in tensor_sizes.items()
+            }
 
             return UnifiedCacheStoreConfig(
                 module_path=module_path,
@@ -178,6 +196,9 @@ class UnifiedCacheStoreConfig:
                 component_configs=component_configs,
             )
 
+        page_bytes = page_size * mem_pool_host.get_size_per_token()
+        tensor_size = page_bytes if storage_config.is_mla_model else page_bytes // 2
+        block_size = tensor_size * (1 if storage_config.is_mla_model else 2)
         cfg["tensor_size"] = tensor_size
         cfg["shard_size"] = block_size
         cfg["block_size"] = block_size
@@ -195,10 +216,14 @@ class SglangUcmConnector:
         storage_config: "HiCacheStorageConfig",
         storage_backends: List[str],
         v_store=None,
+        component_stores: Optional[Dict[str, Any]] = None,
     ):
         self.store = store
         self.k_store = store
         self.v_store = v_store
+        self.component_stores = dict(component_stores or {})
+        if not self.component_stores and v_store is not None:
+            self.component_stores = {"k": store, "v": v_store}
         self.mem_pool_host = mem_pool_host
         self.storage_backends = storage_backends
 
@@ -211,16 +236,21 @@ class SglangUcmConnector:
         self.is_kv_split = (
             self.is_mla and mem_pool_host.layout == "page_first_kv_split"
         )
-        self.cache_nums = 2 if self.is_kv_split or not self.is_mla else 1
-        self.split_buffers = (
-            _page_first_kv_split_buffers(mem_pool_host)
+        self.split_components = (
+            _page_first_kv_split_components(mem_pool_host)
             if self.is_kv_split
             else []
         )
+        self.split_buffers = [buffer for _, buffer in self.split_components]
         self.split_tensor_sizes = (
             _page_first_kv_split_tensor_sizes(mem_pool_host)
             if self.is_kv_split
-            else []
+            else {}
+        )
+        self.cache_nums = (
+            len(self.split_components)
+            if self.is_kv_split
+            else (1 if self.is_mla else 2)
         )
 
         self.config_suffix = self._build_config_suffix()
@@ -237,25 +267,27 @@ class SglangUcmConnector:
             storage_config, mem_pool_host
         )
         if ucm_store_config.component_configs is not None:
-            k_config = ucm_store_config.component_configs["k"]
-            v_config = ucm_store_config.component_configs["v"]
             logger.info(
-                "Creating split MLA Posix stores: K=%s, V=%s",
-                k_config["storage_backends"],
-                v_config["storage_backends"],
+                "Creating split MLA Posix stores: %s",
+                {
+                    name: config["storage_backends"]
+                    for name, config in ucm_store_config.component_configs.items()
+                },
             )
-            k_store = UcmConnectorFactoryV1.create_connector(
-                ucm_store_config.name, k_config, ucm_store_config.module_path
-            )
-            v_store = UcmConnectorFactoryV1.create_connector(
-                ucm_store_config.name, v_config, ucm_store_config.module_path
-            )
+            component_stores = {
+                name: UcmConnectorFactoryV1.create_connector(
+                    ucm_store_config.name, config, ucm_store_config.module_path
+                )
+                for name, config in ucm_store_config.component_configs.items()
+            }
+            k_config = ucm_store_config.component_configs["k"]
             return cls(
-                k_store,
+                component_stores["k"],
                 mem_pool_host,
                 storage_config,
                 k_config["storage_backends"],
-                v_store=v_store,
+                v_store=component_stores["v"],
+                component_stores=component_stores,
             )
 
         store = UcmConnectorFactoryV1.create_connector(
@@ -280,7 +312,8 @@ class SglangUcmConnector:
         model_name = "-".join(self.model.split("/")) if self.model else ""
         if self.is_kv_split:
             tensor_fingerprint = "-".join(
-                str(size) for size in self.split_tensor_sizes
+                f"{component}-{size}"
+                for component, size in self.split_tensor_sizes.items()
             )
             return (
                 f"_{model_name}_{self.mem_pool_host.layout}_p{self.page_size}_"
@@ -322,7 +355,8 @@ class SglangUcmConnector:
             )
 
         buffer = self.split_buffers[component_index]
-        tensor_size = self.split_tensor_sizes[component_index]
+        component = self.split_components[component_index][0]
+        tensor_size = self.split_tensor_sizes[component]
         ptr_list = []
         for offset in range(0, len(indices), self.page_size):
             first_token_index = int(indices[offset])
@@ -337,13 +371,16 @@ class SglangUcmConnector:
 
     def _split_tasks(self, keys: List[str], host_indices: torch.Tensor):
         tasks = []
-        for component_index, component in enumerate(("k", "v")):
+        for component_index, (component, _) in enumerate(self.split_components):
             encoded_keys = self._encode_keys(
                 self._get_component_physical_keys(keys, component)
             )
             tasks.append(
-                self._generate_split_task(
-                    encoded_keys, host_indices, component_index
+                (
+                    component,
+                    self._generate_split_task(
+                        encoded_keys, host_indices, component_index
+                    ),
                 )
             )
         return tasks
@@ -351,14 +388,12 @@ class SglangUcmConnector:
     def _run_split_transfer(
         self, operation: str, keys: List[str], host_indices: torch.Tensor
     ) -> bool:
-        stores = (self.k_store, self.v_store)
         component_tasks = self._split_tasks(keys, host_indices)
         submitted_tasks = []
         success = True
 
-        for component, store, (key_list, shard_indices, ptr_list) in zip(
-            ("K", "V"), stores, component_tasks
-        ):
+        for component, (key_list, shard_indices, ptr_list) in component_tasks:
+            store = self.component_stores[component]
             try:
                 submit = (
                     store.load_data if operation == "load" else store.dump_data
@@ -369,7 +404,7 @@ class SglangUcmConnector:
                 logger.error(
                     "UnifiedCache %s MLA %s submit failed: %s",
                     operation,
-                    component,
+                    component.upper(),
                     e,
                 )
                 success = False
@@ -381,7 +416,7 @@ class SglangUcmConnector:
                 logger.error(
                     "UnifiedCache %s MLA %s wait failed: %s",
                     operation,
-                    component,
+                    component.upper(),
                     e,
                 )
                 success = False
@@ -466,7 +501,7 @@ class SglangUcmConnector:
 
         if self.is_kv_split:
             results = []
-            for component, store in zip(("k", "v"), (self.k_store, self.v_store)):
+            for component, store in self.component_stores.items():
                 encoded_key = self._encode_keys(
                     self._get_component_physical_keys([key], component)
                 )
@@ -486,7 +521,7 @@ class SglangUcmConnector:
 
         if self.is_kv_split:
             prefixes = []
-            for component, store in zip(("k", "v"), (self.k_store, self.v_store)):
+            for component, store in self.component_stores.items():
                 encoded_keys = self._encode_keys(
                     self._get_component_physical_keys(keys, component)
                 )
@@ -498,7 +533,9 @@ class SglangUcmConnector:
 
     def close(self) -> None:
         seen = set()
-        for store in (self.k_store, self.v_store):
+        stores = [self.store, self.v_store]
+        stores.extend(self.component_stores.values())
+        for store in stores:
             if store is None or id(store) in seen:
                 continue
             seen.add(id(store))
