@@ -23,6 +23,7 @@ _install_sglang_stubs()
 from ucm.integration.sglang.ucm_connector import (  # noqa: E402
     SglangUcmConnector,
     UnifiedCacheStoreConfig,
+    resolve_v1_host_pool,
 )
 
 
@@ -225,3 +226,14 @@ def test_split_ascend_mla_transfers_and_requires_indexer():
     stores["v"].prefix = 4
     stores["indexer"].prefix = 1
     assert connector.batch_exists(["0", "1", "2", "3", "4"]) == 2
+
+
+def test_host_pool_group_resolves_to_v1_anchor_pool(tmp_path):
+    pool = _make_pool(with_indexer=True)
+    group = SimpleNamespace(anchor_entry=SimpleNamespace(host_pool=pool))
+
+    assert resolve_v1_host_pool(group) is pool
+    config = UnifiedCacheStoreConfig.load_from_config(
+        _make_storage_config(str(tmp_path / "ucm")), group
+    )
+    assert list(config.component_configs) == ["k", "v", "indexer"]

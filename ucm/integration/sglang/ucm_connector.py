@@ -21,6 +21,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def resolve_v1_host_pool(mem_pool_host: Any):
+    """Return the primary KV host pool from a raw pool or HostPoolGroup."""
+    anchor_entry = getattr(mem_pool_host, "anchor_entry", None)
+    if anchor_entry is None:
+        return mem_pool_host
+    host_pool = getattr(anchor_entry, "host_pool", None)
+    if host_pool is None:
+        raise ValueError("HostPoolGroup anchor entry has no host_pool")
+    return host_pool
+
+
 def _page_first_kv_split_components(
     mem_pool_host: "HostKVCache",
 ) -> List[Tuple[str, torch.Tensor]]:
@@ -125,6 +136,7 @@ class UnifiedCacheStoreConfig:
     def load_from_config(
         storage_config: "HiCacheStorageConfig", mem_pool_host: "HostKVCache"
     ) -> "UnifiedCacheStoreConfig":
+        mem_pool_host = resolve_v1_host_pool(mem_pool_host)
         extra = dict(getattr(storage_config, "extra_config", None) or {})
         if "kv_connector_extra_config" not in extra:
             yaml_extra = _load_extra_config_from_yaml_env()
@@ -218,6 +230,7 @@ class SglangUcmConnector:
         v_store=None,
         component_stores: Optional[Dict[str, Any]] = None,
     ):
+        mem_pool_host = resolve_v1_host_pool(mem_pool_host)
         self.store = store
         self.k_store = store
         self.v_store = v_store
@@ -263,6 +276,7 @@ class SglangUcmConnector:
     ) -> "SglangUcmConnector":
         if mem_pool_host is None:
             raise ValueError("mem_pool_host must be provided for UnifiedCache")
+        mem_pool_host = resolve_v1_host_pool(mem_pool_host)
         ucm_store_config = UnifiedCacheStoreConfig.load_from_config(
             storage_config, mem_pool_host
         )

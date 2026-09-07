@@ -9,7 +9,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-from ucm.integration.sglang.ucm_connector import SglangUcmConnector
+from ucm.integration.sglang.ucm_connector import (
+    SglangUcmConnector,
+    resolve_v1_host_pool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +32,9 @@ class UnifiedCacheStore(HiCacheStorage):
         self.connector: Optional[SglangUcmConnector] = None
         self.store = None
         self.mem_pool_host: Optional[HostKVCache] = None
+        self.v1_mem_pool_host: Optional[HostKVCache] = None
 
-        if isinstance(context, HostKVCache):
+        if isinstance(context, HostKVCache) or hasattr(context, "anchor_entry"):
             self.register_mem_pool_host(context)
 
     def _ensure_initialized(self) -> SglangUcmConnector:
@@ -43,22 +47,24 @@ class UnifiedCacheStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        v1_mem_pool_host = resolve_v1_host_pool(mem_pool_host)
         supported_layouts = {"page_first", "page_first_kv_split"}
-        if mem_pool_host.layout not in supported_layouts:
+        if v1_mem_pool_host.layout not in supported_layouts:
             raise ValueError(
                 "UnifiedCacheStore currently requires --hicache-mem-layout "
                 "page_first or page_first_kv_split, "
-                f"got {mem_pool_host.layout!r}."
+                f"got {v1_mem_pool_host.layout!r}."
             )
 
         self.mem_pool_host = mem_pool_host
+        self.v1_mem_pool_host = v1_mem_pool_host
         if self.connector is None:
             self.connector = SglangUcmConnector.from_hicache(
-                self.storage_config, mem_pool_host
+                self.storage_config, v1_mem_pool_host
             )
             self.store = self.connector.store
         else:
-            self.connector.mem_pool_host = mem_pool_host
+            self.connector.mem_pool_host = v1_mem_pool_host
 
     def batch_get_v1(
         self,
