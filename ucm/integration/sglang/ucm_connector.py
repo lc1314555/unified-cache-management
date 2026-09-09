@@ -229,6 +229,7 @@ class SglangUcmConnector:
         storage_backends: List[str],
         v_store=None,
         component_stores: Optional[Dict[str, Any]] = None,
+        ucm_store_config: Optional[UnifiedCacheStoreConfig] = None,
     ):
         mem_pool_host = resolve_v1_host_pool(mem_pool_host)
         self.store = store
@@ -239,6 +240,10 @@ class SglangUcmConnector:
             self.component_stores = {"k": store, "v": v_store}
         self.mem_pool_host = mem_pool_host
         self.storage_backends = storage_backends
+        self.ucm_store_config = ucm_store_config
+        self.v2_pools: Dict[str, Any] = {}
+        self.v2_stores: Dict[str, Any] = {}
+        self.v2_page_bytes: Dict[str, int] = {}
 
         self.dtype = mem_pool_host.dtype
         self.page_size = mem_pool_host.page_size
@@ -302,6 +307,7 @@ class SglangUcmConnector:
                 k_config["storage_backends"],
                 v_store=component_stores["v"],
                 component_stores=component_stores,
+                ucm_store_config=ucm_store_config,
             )
 
         store = UcmConnectorFactoryV1.create_connector(
@@ -314,7 +320,131 @@ class SglangUcmConnector:
             mem_pool_host,
             storage_config,
             ucm_store_config.config["storage_backends"],
+            ucm_store_config=ucm_store_config,
         )
+
+    @staticmethod
+    def _pool_name_value(pool_name: Any) -> str:
+        return str(getattr(pool_name, "value", pool_name))
+
+    def register_v2_pool(self, host_pool: Any, pool_name: Any) -> None:
+        name = self._pool_name_value(pool_name)
+        if name == "kv":
+            return
+        if name != "indexer":
+            raise NotImplementedError(
+                "UnifiedCache currently supports only the INDEXER V2 pool, "
+                f"got {name!r}"
+            )
+        registered_pool = self.v2_pools.get(name)
+        if registered_pool is host_pool:
+            return
+        if registered_pool is not None:
+            raise ValueError(f"V2 pool {name!r} has already been registered")
+        if self.ucm_store_config is None:
+            raise RuntimeError(
+                "UnifiedCache connector factory configuration is unavailable"
+            )
+
+        page_bytes = int(host_pool.page_size) * int(host_pool.get_size_per_token())
+        config = _make_posix_component_config(
+            self.ucm_store_config.config, name, page_bytes
+        )
+        if bool(config.get("io_direct", True)):
+            sample_indices = torch.arange(host_pool.page_size, dtype=torch.int64)
+            pointers, sizes = host_pool.get_page_buffer_meta(sample_indices)
+            if any(int(ptr) % 4096 for ptr in pointers) or any(
+                int(size) % 4096 for size in sizes
+            ):
+                raise ValueError(
+                    f"V2 {name} pool is not 4096-byte aligned; set io_direct=false"
+                )
+
+        self.v2_pools[name] = host_pool
+        self.v2_page_bytes[name] = page_bytes
+        self.v2_stores[name] = UcmConnectorFactoryV1.create_connector(
+            self.ucm_store_config.name,
+            config,
+            self.ucm_store_config.module_path,
+        )
+        logger.info(
+            "Created UnifiedCache V2 %s Posix store: page_bytes=%d, backends=%s",
+            name,
+            page_bytes,
+            config["storage_backends"],
+        )
+
+    def _get_v2_physical_keys(self, keys: List[str], name: str) -> List[str]:
+        page_bytes = self.v2_page_bytes[name]
+        suffix = (
+            f"_{name}_{self.mem_pool_host.layout}_p{self.page_size}_"
+            f"tp{self.tp_rank}of{self.tp_size}_b{page_bytes}"
+        )
+        return [self._get_physical_key(key) + suffix for key in keys]
+
+    def _generate_v2_task(self, transfer: Any):
+        name = self._pool_name_value(transfer.name)
+        if name not in self.v2_pools:
+            raise ValueError(f"V2 pool {name!r} has not been registered")
+        keys = list(transfer.keys or [])
+        host_indices = transfer.host_indices
+        if host_indices is None:
+            raise ValueError(f"V2 {name} transfer has no host_indices")
+        host_pool = self.v2_pools[name]
+        if len(host_indices) != len(keys) * int(host_pool.page_size):
+            raise ValueError(
+                f"V2 {name} page count mismatch: keys={len(keys)}, "
+                f"host_indices={len(host_indices)}, page_size={host_pool.page_size}"
+            )
+        pointers, sizes = host_pool.get_page_buffer_meta(host_indices)
+        page_bytes = self.v2_page_bytes[name]
+        if len(pointers) != len(keys) or any(
+            int(size) != page_bytes for size in sizes
+        ):
+            raise ValueError(
+                f"V2 {name} host pool returned inconsistent page metadata"
+            )
+        encoded_keys = self._encode_keys(self._get_v2_physical_keys(keys, name))
+        return name, encoded_keys, [0] * len(keys), [[int(p)] for p in pointers]
+
+    def batch_transfer_v2(
+        self, transfers: List[Any], operation: str
+    ) -> Dict[Any, List[bool]]:
+        results: Dict[Any, List[bool]] = {}
+        for transfer in transfers:
+            name, keys, shard_indices, pointers = self._generate_v2_task(transfer)
+            if not keys:
+                results[transfer.name] = []
+                continue
+            store = self.v2_stores[name]
+            try:
+                submit = store.load_data if operation == "load" else store.dump_data
+                task = submit(keys, shard_indices, pointers)
+                store.wait(task)
+                results[transfer.name] = [True] * len(keys)
+            except RuntimeError as error:
+                logger.error(
+                    "UnifiedCache V2 %s %s failed: %s", name, operation, error
+                )
+                results[transfer.name] = [False] * len(keys)
+        return results
+
+    def batch_exists_v2(
+        self, keys: List[str], transfers: Optional[List[Any]]
+    ) -> Dict[Any, int]:
+        if not keys:
+            return {transfer.name: 0 for transfer in transfers or []}
+        hits: Dict[Any, int] = {}
+        for transfer in transfers or []:
+            name = self._pool_name_value(transfer.name)
+            if name not in self.v2_stores:
+                raise ValueError(f"V2 pool {name!r} has not been registered")
+            physical_keys = self._get_v2_physical_keys(keys, name)
+            prefix = self.v2_stores[name].lookup_on_prefix(
+                self._encode_keys(physical_keys)
+            )
+            hits[transfer.name] = int(prefix) + 1
+        return hits
 
     def _encode_key(self, key: str) -> bytes:
         return hashlib.md5(key.encode("utf-8")).digest()
@@ -549,6 +679,7 @@ class SglangUcmConnector:
         seen = set()
         stores = [self.store, self.v_store]
         stores.extend(self.component_stores.values())
+        stores.extend(self.v2_stores.values())
         for store in stores:
             if store is None or id(store) in seen:
                 continue

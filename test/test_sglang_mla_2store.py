@@ -237,3 +237,83 @@ def test_host_pool_group_resolves_to_v1_anchor_pool(tmp_path):
         _make_storage_config(str(tmp_path / "ucm")), group
     )
     assert list(config.component_configs) == ["k", "v", "indexer"]
+
+
+def test_cuda_indexer_uses_independent_v2_posix_store(monkeypatch, tmp_path):
+    created = []
+
+    def create_connector(name, config, module_path):
+        store = FakeStore()
+        created.append((store, config))
+        return store
+
+    monkeypatch.setattr(
+        "ucm.integration.sglang.ucm_connector.UcmConnectorFactoryV1.create_connector",
+        create_connector,
+    )
+    storage_config = _make_storage_config(str(tmp_path / "ucm"))
+    base_config = UnifiedCacheStoreConfig.load_from_config(
+        storage_config,
+        SimpleNamespace(
+            page_size=2,
+            page_num=4,
+            layout="page_first",
+            dtype="fake",
+            get_size_per_token=lambda: 75,
+        ),
+    )
+    connector = SglangUcmConnector(
+        FakeStore(),
+        SimpleNamespace(
+            page_size=2,
+            page_num=4,
+            layout="page_first",
+            dtype="fake",
+        ),
+        storage_config,
+        [str(tmp_path / "ucm")],
+        ucm_store_config=base_config,
+    )
+    indexer_pool = SimpleNamespace(
+        page_size=2,
+        get_size_per_token=lambda: 16,
+        get_page_buffer_meta=lambda indices: (
+            [0x400000 + i * 32 for i in range(len(indices) // 2)],
+            [32] * (len(indices) // 2),
+        ),
+    )
+
+    connector.register_v2_pool(indexer_pool, "indexer")
+    store, config = created[0]
+    assert config["storage_backends"] == [str(tmp_path / "ucm" / "indexer")]
+    assert config["tensor_size"] == 32
+
+    transfer = SimpleNamespace(
+        name="indexer",
+        keys=["page0", "page1"],
+        host_indices=FakeHostIndices([0, 1, 2, 3]),
+    )
+    assert connector.batch_transfer_v2([transfer], "dump") == {
+        "indexer": [True, True]
+    }
+    assert store.dumps[0][1:] == (
+        [0, 0],
+        [[0x400000], [0x400000 + 32]],
+    )
+    assert store.dumps[0][0][0] != store.dumps[0][0][1]
+
+    store.prefix = 0
+    assert connector.batch_exists_v2(["page0", "page1"], [transfer]) == {
+        "indexer": 1
+    }
+
+
+def test_v2_kv_registration_is_ignored():
+    connector = SglangUcmConnector(
+        FakeStore(),
+        SimpleNamespace(page_size=2, layout="page_first", dtype="fake"),
+        _make_storage_config(),
+        ["/mnt/ucm0"],
+    )
+    connector.register_v2_pool(object(), "kv")
+    assert connector.v2_stores == {}

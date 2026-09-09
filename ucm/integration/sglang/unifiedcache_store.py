@@ -6,6 +6,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -48,11 +51,15 @@ class UnifiedCacheStore(HiCacheStorage):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
         v1_mem_pool_host = resolve_v1_host_pool(mem_pool_host)
-        supported_layouts = {"page_first", "page_first_kv_split"}
+        supported_layouts = {
+            "page_first",
+            "page_first_direct",
+            "page_first_kv_split",
+        }
         if v1_mem_pool_host.layout not in supported_layouts:
             raise ValueError(
                 "UnifiedCacheStore currently requires --hicache-mem-layout "
-                "page_first or page_first_kv_split, "
+                "page_first, page_first_direct, or page_first_kv_split, "
                 f"got {v1_mem_pool_host.layout!r}."
             )
 
@@ -81,6 +88,46 @@ class UnifiedCacheStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         return self._ensure_initialized().batch_set_v1(keys, host_indices, extra_info)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        pool_name = str(getattr(host_pool_name, "value", host_pool_name))
+        if pool_name == PoolName.KV.value:
+            return
+        super().register_mem_host_pool_v2(host_pool, host_pool_name)
+        if pool_name == PoolName.INDEXER.value:
+            self._ensure_initialized().register_v2_pool(host_pool, host_pool_name)
+        else:
+            logger.warning(
+                "UnifiedCache V2 pool %s is registered by SGLang but is not "
+                "handled by this connector",
+                pool_name,
+            )
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        connector = self._ensure_initialized()
+        kv_hit_pages = connector.batch_exists(keys, extra_info)
+        extra_hits = connector.batch_exists_v2(keys, pool_transfers)
+        final_pages = min([kv_hit_pages, *extra_hits.values()])
+        return PoolTransferResult(final_pages, extra_hits)
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        return self._ensure_initialized().batch_transfer_v2(transfers, "load")
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        return self._ensure_initialized().batch_transfer_v2(transfers, "dump")
 
     def get(
         self,
