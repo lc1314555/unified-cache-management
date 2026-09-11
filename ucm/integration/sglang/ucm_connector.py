@@ -141,6 +141,7 @@ class SglangUcmConnector:
         self.ucm_store_config: Optional[UnifiedCacheStoreConfig] = None
         self.registered_pools: Dict[Any, Any] = {}
         self.pool_components: Dict[Any, List[tuple[Any, int]]] = {}
+        self.flattened_pools: set[Any] = set()
 
     @classmethod
     def from_hicache(
@@ -213,6 +214,25 @@ class SglangUcmConnector:
         _, page_sizes = self._flatten_page_meta(ptrs, sizes, 1)
         components = []
         pool_value = self._pool_value(pool_name)
+        if pool_value == "mamba":
+            # Mamba owns heterogeneous temporal/SSM and convolution buffers.
+            # Store one fixed-size flattened page instead of provisioning one
+            # PosixStore per component. This deliberately trades an L2 copy for
+            # fewer stores and page-level storage atomicity.
+            total_size = sum(int(size) for size in page_sizes[0] if int(size) > 0)
+            if total_size <= 0:
+                raise ValueError("Mamba hybrid pool has no non-empty components")
+            namespace = f"{pool_value}_flat_{total_size}"
+            cfg = self.ucm_store_config.fixed_size_config(namespace, total_size)
+            store = UcmConnectorFactoryV1.create_connector(
+                self.ucm_store_config.name,
+                cfg,
+                self.ucm_store_config.module_path,
+            )
+            self.pool_components[pool_name] = [(store, total_size)]
+            self.flattened_pools.add(pool_name)
+            return
+
         for component_index, size in enumerate(page_sizes[0]):
             size = int(size)
             if size <= 0:
@@ -273,6 +293,11 @@ class SglangUcmConnector:
     ) -> Dict[str, List[bool]]:
         results: Dict[str, List[bool]] = {}
         for transfer in transfers:
+            if transfer.name in self.flattened_pools:
+                results[transfer.name] = self._batch_io_flattened_pool(
+                    transfer, is_set
+                )
+                continue
             keys, page_ptrs, _ = self._transfer_meta(transfer)
             page_results = [True] * len(keys)
             for component_index, (store, _) in enumerate(
@@ -301,6 +326,65 @@ class SglangUcmConnector:
                     page_results = [False] * len(keys)
             results[transfer.name] = page_results
         return results
+
+    def _batch_io_flattened_pool(
+        self, transfer: "PoolTransfer", is_set: bool
+    ) -> List[bool]:
+        """Transfer a heterogeneous pool as one contiguous page per key."""
+        host_pool = self.registered_pools[transfer.name]
+        keys = list(transfer.keys or [])
+        if not keys:
+            return []
+        page_size = int(getattr(host_pool, "page_size", 1) or 1)
+        host_indices = transfer.host_indices
+        if host_indices is None or len(host_indices) != len(keys) * page_size:
+            raise ValueError(
+                f"Hybrid pool {transfer.name} expects "
+                f"{len(keys) * page_size} host indices"
+            )
+
+        page_offsets = [
+            int(host_indices[index * page_size].item()) for index in range(len(keys))
+        ]
+        if is_set:
+            staging_pages = [
+                host_pool.get_data_page(offset, flat=True) for offset in page_offsets
+            ]
+        else:
+            staging_pages = [
+                host_pool.get_dummy_flat_data_page() for _ in page_offsets
+            ]
+
+        store, expected_size = self.pool_components[transfer.name][0]
+        actual_sizes = [page.numel() * page.element_size() for page in staging_pages]
+        if any(size != expected_size for size in actual_sizes):
+            raise ValueError(
+                f"Hybrid pool {transfer.name} flattened page size changed: "
+                f"expected {expected_size}, got {actual_sizes}"
+            )
+
+        encoded = [self._component_key(key, transfer.name, 0) for key in keys]
+        pointers = [[page.data_ptr()] for page in staging_pages]
+        try:
+            task = (
+                store.dump_data(encoded, [0] * len(keys), pointers)
+                if is_set
+                else store.load_data(encoded, [0] * len(keys), pointers)
+            )
+            store.wait(task)
+        except RuntimeError as exc:
+            logger.error(
+                "UnifiedCache %s failed for flattened pool %s: %s",
+                "dump" if is_set else "load",
+                transfer.name,
+                exc,
+            )
+            return [False] * len(keys)
+
+        if not is_set:
+            for offset, page in zip(page_offsets, staging_pages):
+                host_pool.set_from_flat_data_page(offset, page)
+        return [True] * len(keys)
 
     def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
         from sglang.srt.mem_cache.hicache_storage import (
