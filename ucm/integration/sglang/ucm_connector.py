@@ -1,9 +1,10 @@
 import hashlib
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 import torch
 import yaml
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import (
         HiCacheStorageConfig,
         HiCacheStorageExtraInfo,
+        PoolTransfer,
     )
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -45,6 +47,23 @@ class UnifiedCacheStoreConfig:
     module_path: str
     name: str
     config: Dict[str, Any]
+
+    def fixed_size_config(self, namespace: str, tensor_size: int) -> Dict[str, Any]:
+        """Build an isolated fixed-size Posix configuration for one v2 component."""
+        cfg = dict(self.config)
+        safe_namespace = re.sub(r"[^A-Za-z0-9_.-]", "_", namespace)
+        storage_backends = []
+        for path in self.config["storage_backends"]:
+            component_path = Path(path) / "sglang_v2" / safe_namespace
+            # PosixStore creates its data directories but expects the configured
+            # storage root itself to exist.
+            component_path.mkdir(parents=True, exist_ok=True)
+            storage_backends.append(str(component_path))
+        cfg["storage_backends"] = storage_backends
+        cfg["tensor_size"] = tensor_size
+        cfg["shard_size"] = tensor_size
+        cfg["block_size"] = tensor_size
+        return cfg
 
     @staticmethod
     def load_from_config(
@@ -119,6 +138,9 @@ class SglangUcmConnector:
         self.tp_size = storage_config.tp_size
 
         self.config_suffix = self._build_config_suffix()
+        self.ucm_store_config: Optional[UnifiedCacheStoreConfig] = None
+        self.registered_pools: Dict[Any, Any] = {}
+        self.pool_components: Dict[Any, List[tuple[Any, int]]] = {}
 
     @classmethod
     def from_hicache(
@@ -134,12 +156,216 @@ class SglangUcmConnector:
         store = UcmConnectorFactoryV1.create_connector(
             ucm_store_config.name, ucm_store_config.config, ucm_store_config.module_path
         )
-        return cls(
+        connector = cls(
             store,
             mem_pool_host,
             storage_config,
             ucm_store_config.config["storage_backends"],
         )
+        connector.ucm_store_config = ucm_store_config
+        return connector
+
+    @staticmethod
+    def _pool_value(pool_name: Any) -> str:
+        return str(getattr(pool_name, "value", pool_name))
+
+    @staticmethod
+    def _flatten_page_meta(
+        ptr_list: Sequence[Any], size_list: Sequence[Any], page_count: int
+    ) -> tuple[List[List[int]], List[List[int]]]:
+        """Normalize HostKVCache metadata into one component list per page."""
+        if page_count == 0:
+            return [], []
+        if len(ptr_list) == page_count and ptr_list and isinstance(
+            ptr_list[0], (list, tuple)
+        ):
+            page_ptrs = [list(values) for values in ptr_list]
+            page_sizes = [list(values) for values in size_list]
+        else:
+            if len(ptr_list) % page_count != 0:
+                raise ValueError(
+                    f"Host pool returned {len(ptr_list)} buffers for {page_count} pages"
+                )
+            width = len(ptr_list) // page_count
+            page_ptrs = [
+                list(ptr_list[i * width : (i + 1) * width])
+                for i in range(page_count)
+            ]
+            page_sizes = [
+                list(size_list[i * width : (i + 1) * width])
+                for i in range(page_count)
+            ]
+        if any(len(p) != len(s) for p, s in zip(page_ptrs, page_sizes)):
+            raise ValueError("Host pool returned mismatched pointer and size metadata")
+        widths = {len(values) for values in page_ptrs}
+        if len(widths) != 1:
+            raise ValueError("Host pool component count must be stable across pages")
+        return page_ptrs, page_sizes
+
+    def register_pool_v2(self, host_pool: "HostKVCache", pool_name: Any) -> None:
+        """Register an arbitrary hybrid pool and provision fixed-size stores lazily."""
+        self.registered_pools[pool_name] = host_pool
+        if self.ucm_store_config is None:
+            raise RuntimeError("UCM connector configuration is not initialized")
+        page_size = int(getattr(host_pool, "page_size", 1) or 1)
+        probe_indices = torch.arange(page_size, dtype=torch.int64)
+        ptrs, sizes = host_pool.get_page_buffer_meta(probe_indices)
+        _, page_sizes = self._flatten_page_meta(ptrs, sizes, 1)
+        components = []
+        pool_value = self._pool_value(pool_name)
+        for component_index, size in enumerate(page_sizes[0]):
+            size = int(size)
+            if size <= 0:
+                continue
+            namespace = f"{pool_value}_component_{component_index}_{size}"
+            cfg = self.ucm_store_config.fixed_size_config(namespace, size)
+            store = UcmConnectorFactoryV1.create_connector(
+                self.ucm_store_config.name,
+                cfg,
+                self.ucm_store_config.module_path,
+            )
+            components.append((store, size))
+        if not components:
+            raise ValueError(f"Hybrid pool {pool_value!r} has no non-empty components")
+        self.pool_components[pool_name] = components
+
+    def _component_key(self, logical_key: str, pool_name: Any, index: int) -> bytes:
+        physical = (
+            f"{logical_key}{self.config_suffix}"
+            f"__v2_tp_{self.tp_rank}_{self.tp_size}"
+            f"__pool_{self._pool_value(pool_name)}__component_{index}"
+        )
+        return self._encode_key(physical)
+
+    def _transfer_meta(self, transfer: "PoolTransfer"):
+        host_pool = self.registered_pools.get(transfer.name)
+        if host_pool is None:
+            raise ValueError(f"Unregistered UCM hybrid pool: {transfer.name}")
+        keys = list(transfer.keys or [])
+        if not keys:
+            return keys, [], []
+        page_size = int(getattr(host_pool, "page_size", 1) or 1)
+        if transfer.host_indices is None or len(transfer.host_indices) != (
+            len(keys) * page_size
+        ):
+            raise ValueError(
+                f"Hybrid pool {transfer.name} expects "
+                f"{len(keys) * page_size} host indices"
+            )
+        ptrs, sizes = host_pool.get_page_buffer_meta(transfer.host_indices)
+        page_ptrs, page_sizes = self._flatten_page_meta(ptrs, sizes, len(keys))
+        expected = [size for _, size in self.pool_components[transfer.name]]
+        for sizes_for_page in page_sizes:
+            actual = [int(size) for size in sizes_for_page if int(size) > 0]
+            if actual != expected:
+                raise ValueError(
+                    f"Hybrid pool {transfer.name} component sizes changed: "
+                    f"expected {expected}, got {actual}"
+                )
+        page_ptrs = [
+            [ptr for ptr, size in zip(ptrs_for_page, sizes_for_page) if int(size) > 0]
+            for ptrs_for_page, sizes_for_page in zip(page_ptrs, page_sizes)
+        ]
+        return keys, page_ptrs, page_sizes
+
+    def batch_io_v2(
+        self, transfers: List["PoolTransfer"], is_set: bool
+    ) -> Dict[str, List[bool]]:
+        results: Dict[str, List[bool]] = {}
+        for transfer in transfers:
+            keys, page_ptrs, _ = self._transfer_meta(transfer)
+            page_results = [True] * len(keys)
+            for component_index, (store, _) in enumerate(
+                self.pool_components[transfer.name]
+            ):
+                encoded = [
+                    self._component_key(key, transfer.name, component_index)
+                    for key in keys
+                ]
+                pointers = [[page[component_index]] for page in page_ptrs]
+                try:
+                    task = (
+                        store.dump_data(encoded, [0] * len(keys), pointers)
+                        if is_set
+                        else store.load_data(encoded, [0] * len(keys), pointers)
+                    )
+                    store.wait(task)
+                except RuntimeError as exc:
+                    logger.error(
+                        "UnifiedCache %s failed for pool %s component %d: %s",
+                        "dump" if is_set else "load",
+                        transfer.name,
+                        component_index,
+                        exc,
+                    )
+                    page_results = [False] * len(keys)
+            results[transfer.name] = page_results
+        return results
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        from sglang.srt.mem_cache.hicache_storage import (
+            PoolHitPolicy,
+            PoolTransferResult,
+        )
+
+        # Some hybrid layouts (notably DeepSeek V4) use a logical KV anchor;
+        # all physical payloads live in v2 pools in that case.
+        kv_pages = (
+            len(keys)
+            if getattr(self.mem_pool_host, "kv_buffer", None) is None
+            else self.batch_exists(keys, extra_info)
+        )
+        restorable = list(range(1, kv_pages + 1))
+        hit_counts = {"kv": kv_pages} if kv_pages else {}
+        for transfer in pool_transfers or []:
+            components = self.pool_components.get(transfer.name)
+            if components is None:
+                raise ValueError(f"Unregistered UCM hybrid pool: {transfer.name}")
+            page_exists = [True] * kv_pages
+            for component_index, (store, _) in enumerate(components):
+                encoded = [
+                    self._component_key(key, transfer.name, component_index)
+                    for key in keys[:kv_pages]
+                ]
+                component_exists = [bool(value) for value in store.lookup(encoded)]
+                page_exists = [
+                    a and b for a, b in zip(page_exists, component_exists)
+                ]
+            pool_restorable = []
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = (
+                    page_exists.index(False) if False in page_exists else kv_pages
+                )
+                pool_restorable = list(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys or []) or 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(page_exists[max(0, prefix_len - trailing) : prefix_len]):
+                        pool_restorable.append(prefix_len)
+                        boundary = max(boundary, prefix_len)
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
+            if boundary:
+                hit_counts[transfer.name] = boundary
+            allowed = set(pool_restorable)
+            restorable = [value for value in restorable if value in allowed]
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_counts, restorable)
+
+    def close(self) -> None:
+        seen = set()
+        for store in [self.store] + [
+            store
+            for components in self.pool_components.values()
+            for store, _ in components
+        ]:
+            if id(store) in seen:
+                continue
+            seen.add(id(store))
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
 
     def _encode_key(self, key: str) -> bytes:
         return hashlib.md5(key.encode("utf-8")).digest()

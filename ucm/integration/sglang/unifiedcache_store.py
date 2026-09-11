@@ -6,6 +6,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -57,6 +59,36 @@ class UnifiedCacheStore(HiCacheStorage):
             self.store = self.connector.store
         else:
             self.connector.mem_pool_host = mem_pool_host
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        # SGLang registers the KV anchor through both APIs; v1 already owns it.
+        if str(getattr(host_pool_name, "value", host_pool_name)) == "kv":
+            return
+        self._ensure_initialized().register_pool_v2(host_pool, host_pool_name)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        return self._ensure_initialized().batch_exists_v2(
+            keys, pool_transfers, extra_info
+        )
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        return self._ensure_initialized().batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        return self._ensure_initialized().batch_io_v2(transfers, is_set=True)
 
     def batch_get_v1(
         self,
@@ -129,9 +161,8 @@ class UnifiedCacheStore(HiCacheStorage):
         return False
 
     def close(self) -> None:
-        close = getattr(self.store, "close", None)
-        if callable(close):
-            close()
+        if self.connector is not None:
+            self.connector.close()
 
     def get_stats(self):
         connector = self.connector
