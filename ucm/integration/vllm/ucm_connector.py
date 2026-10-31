@@ -1,5 +1,6 @@
 import copy
 import glob
+import hashlib
 import math
 import os
 import re
@@ -2846,6 +2847,33 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._layerwise_save_bytes = 0
         logger.info("Init UCMLayerWiseConnector.")
 
+    def _diag_layerwise(self, phase, layer_id, keys, blocks, ptrs=None):
+        """Bounded diagnostics; optional digests synchronize device copies."""
+        if not self.launch_config.get("layerwise_diag", False):
+            return
+        if layer_id not in self.launch_config.get("layerwise_diag_layers", [0, 6]):
+            return
+        n = min(max(0, int(self.launch_config.get("layerwise_diag_max_blocks", 2))), len(keys), len(blocks))
+        logger.info("[UCM_DIAG] phase=%s rank=%s layer=%s count=%s keys=%s blocks=%s ptrs=%s sizes=%s",
+                    phase, self.tp_rank, layer_id, len(keys),
+                    [k.hex() for k in keys[:n]], list(blocks[:n]),
+                    None if ptrs is None else ptrs[:n].tolist(), self.kv_cache_layout.tensor_size_list)
+        if phase == "LOAD_SUBMIT" or not self.launch_config.get("layerwise_diag_digest", False):
+            return
+        for name, cache in self.kv_caches.items():
+            if self.layer_name_to_id.get(name) != layer_id:
+                continue
+            tensors = [cache] if isinstance(cache, torch.Tensor) else list(cache)
+            for component, tensor in enumerate(tensors):
+                for key, block in zip(keys[:n], blocks[:n]):
+                    try:
+                        raw = tensor[int(block)].detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                        logger.info("[UCM_DIAG_DIGEST] phase=%s rank=%s key=%s layer=%s component=%s block=%s shape=%s stride=%s dtype=%s bytes=%s sha256=%s",
+                                    phase, self.tp_rank, key.hex(), name, component, block,
+                                    tuple(tensor.shape), tensor.stride(), tensor.dtype, len(raw), hashlib.sha256(raw).hexdigest())
+                    except Exception:
+                        logger.exception("[UCM_DIAG] digest failed phase=%s layer=%s block=%s", phase, name, block)
+
     def _record_layerwise_load_duration(self, layer_id: int, load_end: float) -> bool:
         if layer_id not in self._layerwise_load_start_by_layer:
             return False
@@ -2883,6 +2911,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         try:
             layer_ptrs = np.ascontiguousarray(self.dump_total_ptrs[local_layer_id])
             shard_indexs = [layer_id] * len(total_ucm_block_ids)
+            self._diag_layerwise("DUMP_SRC", layer_id, total_ucm_block_ids, total_vllm_block_ids, layer_ptrs)
             event_handle = self._get_dump_event_handle()
             task = self._rank_consistency.submit_dump(
                 self.store,
@@ -2933,6 +2962,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             try:
                 shard_indexs = [layer_id] * len(ucm_block_ids)
                 layer_ptrs = total_ptrs[local_row]
+                self._diag_layerwise("LOAD_SUBMIT", layer_id, store_block_ids, metadata.request_meta[request_id].load_block_ids[1], layer_ptrs)
                 task = self._rank_consistency.submit_load(
                     self.store,
                     {request_id: ucm_block_ids},
@@ -3032,6 +3062,10 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 self._connector_worker_meta.mark_failed(request_id)
                 self._failure_req_ids.add(request_id)
             else:
+                diag_keys, diag_blocks = metadata.request_meta[request_id].load_block_ids
+                if self.tp_rank % self.tp_size != 0 and not self.is_mla:
+                    diag_keys = [self.request_hasher(key) for key in diag_keys]
+                self._diag_layerwise("LOAD_DST", current_layer_id, diag_keys, diag_blocks)
                 self._layerwise_load_bytes += (
                     len(metadata.request_meta[request_id].load_block_ids[0])
                     * self.kv_cache_layout.shard_size
